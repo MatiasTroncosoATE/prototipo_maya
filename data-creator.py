@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import random
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import polars as pl
@@ -32,10 +32,6 @@ random.seed(42)
 DEFAULT_DATE_RANGE = (datetime(2024, 2, 5, 9, 0, 0), datetime(2024, 3, 31, 20, 0, 0))
 
 SESSION_OPTIONS = ["EN VIVO", "GRABACIÓN", "SIN ASISTENCIA"]
-
-# Número de sesiones y trabajos
-N_SESSIONS = 8
-N_TRABAJOS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +79,8 @@ def generate_students(n_rows: int) -> pl.DataFrame:
                 "pregunta_1": faker_mx.boolean(chance_of_getting_true=65),
                 "pregunta_2": faker_mx.sentence(nb_words=random.randint(5, 12)),
                 "pregunta_3": random.randint(1, 5),
+                "encuesta_inicial": 1,
+                "encuesta_final": 0,
             }
         )
 
@@ -98,74 +96,65 @@ def generate_students(n_rows: int) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+def _generate_decaying_probs(n: int, start: float = 0.8, end: float = 0.25) -> list[float]:
+    """
+    Genera una lista de probabilidades que decaen exponencialmente de `start` a `end`
+    a lo largo de `n` elementos.
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        return [start]
+
+    # Decaimiento exponencial: p[i] = end + (start - end) * exp(-k * i/(n-1))
+    # Elegimos k tal que el último valor sea aproximadamente end.
+    import math
+    k = 3.0  # factor de caída (mayor k = caída más rápida)
+    probs = []
+    for i in range(n):
+        t = i / (n - 1) if n > 1 else 0
+        p = end + (start - end) * math.exp(-k * t)
+        probs.append(round(p, 4))
+    return probs
+
+
 @dataclass
 class EngagementModel:
     """
-    Encapsula las probabilidades de participación por punto del programa.
+    Encapsula las probabilidades de participación para sesiones y trabajos.
 
     Parámetros
     ----------
-    momento : int
-        0 → primeras 20 % de sesiones/trabajos
-        1 → primeras 50 %
-        2 → 100 %
+    n_sessions : int
+        Número total de sesiones en el programa.
+    n_trabajos : int
+        Número total de trabajos/entregables.
     alpha : float
         Factor de escala que "afina" las distribuciones.
-        > 1 aumenta participación, < 1 la reduce. Rango útil: 0.5 – 1.5.
+        > 1 aumenta participación, < 1 la reduce. Rango útil: 0.5 - 1.5.
     """
 
-    momento: int
+    n_sessions: int
+    n_trabajos: int
     alpha: float = 1.0
 
-    # Probabilidades base por sesión (índice 0-7)
-    _BASE_SESSION_PROBS: list[float] = field(
-        default_factory=lambda: [
-            0.80,  # sesion_1  ← alta asistencia inicial
-            0.65,
-            0.55,
-            0.45,  # caída fuerte en los primeros eventos
-            0.32,
-            0.30,
-            0.30,  # se estabiliza ~30 %
-            0.28,
-        ]
-    )
-
-    # Probabilidades base por trabajo (índice 0-3)
-    _BASE_TRABAJO_PROBS: list[float] = field(
-        default_factory=lambda: [
-            0.60,  # trabajo_1  ← 60 % entrega
-            0.40,
-            0.32,
-            0.30,
-        ]
-    )
+    def __post_init__(self):
+        # Generamos probabilidades base con caída realista
+        self._base_session_probs = _generate_decaying_probs(
+            self.n_sessions, start=0.80, end=0.27
+        )
+        self._base_trabajo_probs = _generate_decaying_probs(
+            self.n_trabajos, start=0.60, end=0.28
+        )
 
     def _clamp(self, p: float) -> float:
         return max(0.0, min(1.0, p * self.alpha))
 
     def session_prob(self, idx: int) -> float:
-        return self._clamp(self._BASE_SESSION_PROBS[idx])
+        return self._clamp(self._base_session_probs[idx])
 
     def trabajo_prob(self, idx: int) -> float:
-        return self._clamp(self._BASE_TRABAJO_PROBS[idx])
-
-    @property
-    def n_sessions(self) -> int:
-        """Número de sesiones activas según el momento del programa."""
-        if self.momento == 0:
-            return max(1, int(N_SESSIONS * 0.20))   # ~2 sesiones
-        if self.momento == 1:
-            return max(1, int(N_SESSIONS * 0.50))   # ~4 sesiones
-        return N_SESSIONS                             # 8 sesiones
-
-    @property
-    def n_trabajos(self) -> int:
-        if self.momento == 0:
-            return max(1, int(N_TRABAJOS * 0.20))   # 1 trabajo
-        if self.momento == 1:
-            return max(1, int(N_TRABAJOS * 0.50))   # 2 trabajos
-        return N_TRABAJOS                             # 4 trabajos
+        return self._clamp(self._base_trabajo_probs[idx])
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +222,8 @@ def _session_asistencia(prob_asistir: float) -> str:
 
 def generate_platform_events(
     students_df: pl.DataFrame,
-    momento: int,
+    n_sessions: int,
+    n_trabajos: int,
     alpha: float = 1.0,
     date_range: tuple[datetime, datetime] | None = None,
     jitter_days: float = 2.0,
@@ -245,10 +235,12 @@ def generate_platform_events(
     ----------
     students_df : pl.DataFrame
         DataFrame producido por `generate_students`.
-    momento : int
-        Avance del programa: 0 (20 %), 1 (50 %), 2 (100 %).
+    n_sessions : int
+        Número total de sesiones en el programa.
+    n_trabajos : int
+        Número total de trabajos/entregables.
     alpha : float
-        Factor de ajuste de distribuciones (0.5 – 1.5 es el rango útil).
+        Factor de ajuste de distribuciones (0.5 - 1.5 es el rango útil).
     date_range : tuple[datetime, datetime] | None
         (inicio, fin) del rango de fechas para los timestamps.
         Si es None se usa DEFAULT_DATE_RANGE.
@@ -270,49 +262,48 @@ def generate_platform_events(
     trabajos_df columnas:
         evento_id, estudiante_id, trabajo_num, entregado (bool), timestamp
     """
-    if momento not in (0, 1, 2):
-        raise ValueError("`momento` debe ser 0, 1 o 2.")
-
     dr = date_range if date_range is not None else DEFAULT_DATE_RANGE
-    model = EngagementModel(momento=momento, alpha=alpha)
+    model = EngagementModel(
+        n_sessions=n_sessions, n_trabajos=n_trabajos, alpha=alpha
+    )
     student_ids: list[int] = students_df["id"].to_list()
 
     sesiones_rows: list[dict] = []
     trabajos_rows: list[dict] = []
 
     for sid in student_ids:
-        # --- Sesiones ---
+        # --- Sesiones (solo positivas) ---
         for s_idx in range(model.n_sessions):
             tipo = _session_asistencia(model.session_prob(s_idx))
-            ts = _random_timestamp(s_idx, model.n_sessions, dr, jitter_days)
-            sesiones_rows.append(
-                {
-                    "evento_id": str(uuid.uuid4()),
-                    "estudiante_id": sid,
-                    "sesion_num": s_idx + 1,
-                    "tipo_asistencia": tipo,
-                    "timestamp": ts.isoformat(),
-                }
-            )
+            if tipo != "SIN ASISTENCIA":  # <-- Solo escribimos si asistió
+                ts = _random_timestamp(s_idx, model.n_sessions, dr, jitter_days)
+                sesiones_rows.append(
+                    {
+                        "evento_id": str(uuid.uuid4()),
+                        "estudiante_id": sid,
+                        "sesion_num": s_idx + 1,
+                        "tipo_asistencia": tipo,
+                        "timestamp": ts.isoformat(),
+                    }
+                )
 
-        # --- Trabajos ---
-        # Los trabajos se mapean linealmente al mismo span temporal que las
-        # sesiones: trabajo_1 cae al inicio, trabajo_N al final.
+        # --- Trabajos (solo entregados) ---
         for t_idx in range(model.n_trabajos):
             entregado = random.random() < model.trabajo_prob(t_idx)
-            mapped_idx = int(
-                t_idx * (model.n_sessions - 1) / max(model.n_trabajos - 1, 1)
-            )
-            ts = _random_timestamp(mapped_idx, model.n_sessions, dr, jitter_days)
-            trabajos_rows.append(
-                {
-                    "evento_id": str(uuid.uuid4()),
-                    "estudiante_id": sid,
-                    "trabajo_num": t_idx + 1,
-                    "entregado": entregado,
-                    "timestamp": ts.isoformat(),
-                }
-            )
+            if entregado:  # <-- Solo escribimos si entregado
+                mapped_idx = int(
+                    t_idx * (model.n_sessions - 1) / max(model.n_trabajos - 1, 1)
+                )
+                ts = _random_timestamp(mapped_idx, model.n_sessions, dr, jitter_days)
+                trabajos_rows.append(
+                    {
+                        "evento_id": str(uuid.uuid4()),
+                        "estudiante_id": sid,
+                        "trabajo_num": t_idx + 1,
+                        "entregado": True,
+                        "timestamp": ts.isoformat(),
+                    }
+                )
 
     sesiones_df = pl.DataFrame(sesiones_rows).with_columns(
         pl.col("estudiante_id").cast(pl.Int32),
@@ -338,6 +329,10 @@ if __name__ == "__main__":
 
     os.makedirs("data", exist_ok=True)
 
+    # -- Parámetros de la campaña (ahora flexibles) --
+    N_SESSIONS = 10      # Número total de sesiones
+    N_TRABAJOS = 10      # Número total de trabajos
+
     # -- Estudiantes --
     print("Generando estudiantes...")
     students = generate_students(n_rows=120)
@@ -347,22 +342,21 @@ if __name__ == "__main__":
     # Rango de fechas del programa (puede cambiarse libremente)
     program_dates = (datetime(2024, 2, 5, 9, 0), datetime(2024, 3, 31, 20, 0))
 
-    # -- Eventos por momento del programa --
+    # -- Escenarios de simulación (alpha y jitter variados) --
     configs = [
-        # (momento, alpha, jitter_days, etiqueta)
-        (0, 1.0, 2.0, "momento_0_inicio"),
-        (1, 1.0, 2.0, "momento_1_medio"),
-        (2, 1.0, 2.0, "momento_2_final"),
-        (2, 1.3, 2.0, "momento_2_optimista"),  # alpha alto → más participación
-        (2, 0.7, 2.0, "momento_2_pesimista"),  # alpha bajo → menos participación
-        (2, 1.0, 0.5, "momento_2_ordenado"),   # jitter bajo → timestamps más estrictos
+        # (alpha, jitter_days, etiqueta)
+        (1.0, 2.0, "base"),
+        (1.3, 2.0, "optimista"),   # alpha alto → más participación
+        (0.7, 2.0, "pesimista"),   # alpha bajo → menos participación
+        (1.0, 0.5, "ordenado"),    # jitter bajo → timestamps más estrictos
     ]
 
-    for momento, alpha, jitter, label in configs:
-        print(f"\nSimulando — {label} (momento={momento}, alpha={alpha}, jitter={jitter}d)...")
+    for alpha, jitter, label in configs:
+        print(f"\nSimulando escenario — {label} (alpha={alpha}, jitter={jitter}d)...")
         sesiones, trabajos = generate_platform_events(
             students,
-            momento=momento,
+            n_sessions=N_SESSIONS,
+            n_trabajos=N_TRABAJOS,
             alpha=alpha,
             date_range=program_dates,
             jitter_days=jitter,
