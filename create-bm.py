@@ -241,6 +241,9 @@ def build_base_monitoreo(
     sesiones = pl.read_csv(sesiones_path, try_parse_dates=True)
     trabajos = pl.read_csv(trabajos_path, try_parse_dates=True)
 
+    # Quitamos preguntas de students
+    students = students.select([c for c in students.columns if not c.startswith("pregunta")])
+
     # Convertir timestamp si es string
     if not sesiones.is_empty() and sesiones["timestamp"].dtype == pl.String:
         sesiones = sesiones.with_columns(pl.col("timestamp").str.to_datetime())
